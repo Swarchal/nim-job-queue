@@ -1,0 +1,12 @@
+nimcache/
+*.out
+tests/test_store
+tests/test_worker
+tests/test_server
+examples/example_server
+examples/example_client
+examples/pipeline_server
+examples/pipeline_client
+examples/print_status
+examples/queue_server
+examples/text_worker
