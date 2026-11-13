@@ -18,7 +18,8 @@ type SqliteBackend* = object
 
 const jobColumns =
   "id, name, status, args_json, result_json, error_message, " &
-  "submitted_at, started_at, finished_at, worker_id, lease_expires_at"
+  "submitted_at, started_at, finished_at, worker_id, lease_expires_at, " &
+  "retry_count, run_after"
 
 const selectJobByIdStatement = sql("SELECT " & jobColumns & " FROM jobs WHERE id = ?")
 
@@ -36,7 +37,9 @@ const createTableStatement =
     started_at       REAL NOT NULL DEFAULT 0,
     finished_at      REAL NOT NULL DEFAULT 0,
     worker_id        TEXT NOT NULL DEFAULT '',
-    lease_expires_at REAL NOT NULL DEFAULT 0
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    retry_count      INTEGER NOT NULL DEFAULT 0,
+    run_after        REAL NOT NULL DEFAULT 0
   )"""
 
 const createIndexStatement =
@@ -50,6 +53,13 @@ const createFinishedIndexStatement =
   sql"""
   CREATE INDEX IF NOT EXISTS finished_jobs_by_finish_order
   ON jobs (finished_at, sequence) WHERE finished_at > 0"""
+
+# Lets earliestDelayedJob find the next job waiting for a retry without
+# reading every queued job.
+const createRunAfterIndexStatement =
+  sql"""
+  CREATE INDEX IF NOT EXISTS jobs_by_status_and_run_after
+  ON jobs (status, run_after)"""
 
 const deleteOldestFinishedStatement =
   sql"""DELETE FROM jobs WHERE sequence IN (
@@ -66,6 +76,13 @@ proc removeOldestFinishedJobs(backend: var SqliteBackend) =
   let removed = backend.database.execAffectedRows(deleteOldestFinishedStatement, excess)
   backend.finishedJobCount -= int(removed)
 
+proc addColumnIfMissing(database: DbConn, columnName: string, definition: string) =
+  ## Bring a database file written by an older version up to date.
+  for row in database.getAllRows(sql"PRAGMA table_info(jobs)"):
+    if row[1] == columnName:
+      return
+  database.exec(sql("ALTER TABLE jobs ADD COLUMN " & columnName & " " & definition))
+
 proc openSqliteBackend*(databasePath: string, maxFinishedJobs: int): SqliteBackend =
   ## Open (creating if needed) the database. `databasePath` ":memory:" keeps
   ## everything in memory.
@@ -81,6 +98,9 @@ proc openSqliteBackend*(databasePath: string, maxFinishedJobs: int): SqliteBacke
   discard result.database.getValue(sql"PRAGMA journal_mode = WAL")
   result.database.exec(sql"PRAGMA synchronous = NORMAL")
   result.database.exec(createTableStatement)
+  result.database.addColumnIfMissing("retry_count", "INTEGER NOT NULL DEFAULT 0")
+  result.database.addColumnIfMissing("run_after", "REAL NOT NULL DEFAULT 0")
+  result.database.exec(createRunAfterIndexStatement)
   result.database.exec(createIndexStatement)
   result.database.exec(createFinishedIndexStatement)
   result.recoveredJobCount = int(
@@ -117,6 +137,8 @@ proc rowToJob(row: Row): JobRecord =
     finishedAt: parseFloat(row[8]),
     workerId: row[9],
     leaseExpiresAt: parseFloat(row[10]),
+    retryCount: parseInt(row[11]),
+    runAfter: parseFloat(row[12]),
   )
 
 proc insertJob*(backend: var SqliteBackend, job: JobRecord) =
@@ -139,9 +161,10 @@ proc claimNextJob*(
 ): Option[JobRecord] =
   ## Mark the oldest queued job whose name is in `jobNames` as running on
   ## `workerId` and return it, or none() if there is no such job. An empty
-  ## `jobNames` matches every name.
-  var query = "SELECT " & jobColumns & " FROM jobs WHERE status = ?"
-  var arguments = @[$jsQueued]
+  ## `jobNames` matches every name. Jobs waiting for a retry are skipped
+  ## until their `run_after` time; `startedAt` is taken as the time now.
+  var query = "SELECT " & jobColumns & " FROM jobs WHERE status = ? AND run_after <= ?"
+  var arguments = @[$jsQueued, $startedAt]
   if jobNames.len > 0:
     var placeholders = newSeq[string](jobNames.len)
     for i in 0 ..< jobNames.len:
@@ -196,6 +219,36 @@ proc requeueExpiredLeases*(backend: var SqliteBackend, now: float): int =
     $now,
   )
   return int(updated)
+
+proc retryJob*(
+    backend: var SqliteBackend, jobId: string, workerId: string, runAfter: float
+): bool =
+  ## Put a running job back in the queue, in its original order, to be run
+  ## again once `runAfter` has passed, and count the retry. Returns false,
+  ## and changes nothing, if the job is no longer running on `workerId`.
+  let updated = backend.database.execAffectedRows(
+    sql"""UPDATE jobs SET status = ?, started_at = 0, worker_id = '',
+          lease_expires_at = 0, retry_count = retry_count + 1, run_after = ?
+          WHERE id = ? AND status = ? AND worker_id = ?""",
+    $jsQueued,
+    $runAfter,
+    jobId,
+    $jsRunning,
+    workerId,
+  )
+  return updated == 1
+
+proc earliestDelayedJob*(backend: var SqliteBackend, now: float): float =
+  ## The soonest `run_after` among queued jobs that are still waiting for
+  ## it, or 0.0 if no job is waiting.
+  let earliest = backend.database.getValue(
+    sql"SELECT MIN(run_after) FROM jobs WHERE status = ? AND run_after > ?",
+    $jsQueued,
+    $now,
+  )
+  if earliest.len == 0:
+    return 0.0
+  return parseFloat(earliest)
 
 proc finishJob*(
     backend: var SqliteBackend,

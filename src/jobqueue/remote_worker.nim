@@ -11,6 +11,11 @@
 ## running job (POST /jobs/{id}/heartbeat) so the server knows the worker is
 ## alive. If the heartbeats stop, the server gives the job to another worker.
 ##
+## Each job thread has its own worker id ("<workerId>-<thread index>"), so
+## the server can tell which thread holds a job. If a thread loses its lease
+## and another thread of the same process claims the job, the first thread's
+## late result is refused like any other worker's.
+##
 ## To deploy new or changed jobs without stopping the server: start workers
 ## running the new code, then press ctrl-c on the old ones. They finish the
 ## job they are running and exit.
@@ -27,7 +32,8 @@ type
     workerName*: string
       ## Start of the worker id the server sees, to tell workers apart in logs.
       ## "" means "worker". The host name, process id and a random suffix are
-      ## always added, e.g. "text-buildbox-4121-9f3a0c2e".
+      ## always added, e.g. "text-buildbox-4121-9f3a0c2e", and each job thread
+      ## adds its index, e.g. "text-buildbox-4121-9f3a0c2e-0".
     pollIntervalSeconds*: float
       ## How long to wait before asking again when there is no job; 0 means 0.5.
 
@@ -45,9 +51,9 @@ type
     shared: ptr SharedState
     registry: ptr JobRegistry
     serverUrl: string
-    workerId: string
+    workerId: string ## the process's id; see threadWorkerId
     jobNames: seq[string]
-    threadIndex: int
+    threadIndex: int ## unused by the heartbeat thread
     pollMilliseconds: int
 
   RemoteWorker* = ref object
@@ -61,7 +67,8 @@ type
     isStopped: bool
 
 const
-  reportAttempts = 3
+  reportAttempts = 5
+  firstReportPauseMilliseconds = 1000 ## doubled after each failed attempt
   reconnectPauseMilliseconds = 1000
 
 var interruptRequested: bool ## set by the ctrl-c hook, read by run()
@@ -71,6 +78,15 @@ proc handleControlC() {.noconv.} =
 
 proc log(context: ThreadContext, message: string) =
   stderr.writeLine("jobqueue worker " & context.workerId & ": " & message)
+
+proc threadWorkerId(workerId: string, threadIndex: int): string =
+  ## The id a job thread claims, reports and sends heartbeats under.
+  return workerId & "-" & $threadIndex
+
+proc isRefusal(error: ref JobQueueError): bool =
+  ## A 4xx reply (409: the job is no longer ours) will not change on a retry.
+  ## Anything else (a 500 from a database error, a 502 from a proxy) might.
+  return error.httpCode.is4xx()
 
 # ---------------------------------------------------------------------------
 # Shared state, always read and written under its lock.
@@ -102,7 +118,10 @@ proc jobPath(jobId: string, action: string): string =
 proc claimJob(
     context: ThreadContext, server: JobClient, httpClient: HttpClient
 ): Option[JobRecord] =
-  let payload = %*{"workerId": context.workerId, "jobNames": context.jobNames}
+  let payload = %*{
+    "workerId": threadWorkerId(context.workerId, context.threadIndex),
+    "jobNames": context.jobNames,
+  }
   let reply = server.sendRequest(httpClient, HttpPost, "/workers/claim", $payload)
   context.shared.setLeaseSeconds(reply["leaseSeconds"].getFloat())
   let jobNode = reply["job"]
@@ -113,6 +132,7 @@ proc claimJob(
       id: jobNode["id"].getStr(),
       name: jobNode["name"].getStr(),
       argsJson: $jobNode["args"],
+      retryCount: jobNode{"retries"}.getInt(),
     )
   )
 
@@ -123,28 +143,41 @@ proc reportOutcome(
     jobId: string,
     outcome: JobOutcome,
 ) =
-  ## Send the outcome, retrying a few times if the server cannot be reached.
-  ## Heartbeats carry on meanwhile, because the job is still marked running.
-  var payload = %*{"workerId": context.workerId, "succeeded": outcome.succeeded}
+  ## Send the outcome, retrying with a growing pause if the server cannot be
+  ## reached or fails. Heartbeats carry on meanwhile, because the job is
+  ## still marked running, so the job stays ours while we retry.
+  var payload = %*{
+    "workerId": threadWorkerId(context.workerId, context.threadIndex),
+    "succeeded": outcome.succeeded,
+  }
   if outcome.succeeded:
     payload["result"] = parseJson(outcome.resultJson)
   else:
     payload["error"] = %outcome.errorMessage
+    if outcome.shouldRetry:
+      payload["retry"] = %true
+      payload["retryDelaySeconds"] = %outcome.retryDelaySeconds
 
+  var pauseMilliseconds = firstReportPauseMilliseconds
   for attempt in 1 .. reportAttempts:
     try:
       discard
         server.sendRequest(httpClient, HttpPost, jobPath(jobId, "result"), $payload)
       return
     except JobQueueError as error:
-      # The server answered but refused: retrying will not help.
-      context.log("the result of job " & jobId & " was not accepted: " & error.msg)
-      return
+      if error.isRefusal():
+        context.log("the result of job " & jobId & " was not accepted: " & error.msg)
+        return
+      context.log(
+        "the server could not record the result of job " & jobId & ": " & error.msg
+      )
     except CatchableError as error:
       context.log("could not send the result of job " & jobId & ": " & error.msg)
       httpClient.close()
       httpClient = newJsonHttpClient()
-      sleep(reconnectPauseMilliseconds)
+    if attempt < reportAttempts:
+      sleep(pauseMilliseconds)
+      pauseMilliseconds *= 2
   context.log(
     "gave up sending the result of job " & jobId &
       "; the server will run it again once its lease expires"
@@ -202,18 +235,23 @@ proc heartbeatLoop(context: ThreadContext) {.thread.} =
     # job gets its first heartbeat straight away rather than up to a third of
     # a lease later.
     if hasRunningJob and epochTime() >= nextHeartbeatAt:
-      let payload = $(%*{"workerId": context.workerId})
-      for jobId in runningJobIds:
+      # A heartbeat that cannot get through within a third of a lease is too
+      # late to matter, and waiting longer would hold up the other jobs'.
+      httpClient.timeout = int(leaseSeconds / 3 * 1000)
+      for threadIndex, jobId in runningJobIds:
         if jobId.len == 0:
           continue
+        let payload = $(%*{"workerId": threadWorkerId(context.workerId, threadIndex)})
         try:
           discard server.sendRequest(
             httpClient, HttpPost, jobPath(jobId, "heartbeat"), payload
           )
         except JobQueueError as error:
-          # Also refused when the job finished just after the copy of
-          # runningJobIds above was taken; that is not worth reporting.
-          if context.shared.isRunningJob(jobId):
+          if not error.isRefusal():
+            context.log("the server could not record a heartbeat: " & error.msg)
+          elif context.shared.isRunningJob(jobId):
+            # Also refused when the job finished just after the copy of
+            # runningJobIds above was taken; that is not worth reporting.
             context.log("lost job " & jobId & ": " & error.msg)
         except CatchableError as error:
           context.log("could not send a heartbeat: " & error.msg)
@@ -246,14 +284,25 @@ proc newRemoteWorker*(config: RemoteWorkerConfig): RemoteWorker =
   initLock(result.shared.lock)
 
 proc workerId*(worker: RemoteWorker): string =
-  ## The id this worker uses with the server.
+  ## The id of this worker process. Each job thread uses it with the server
+  ## followed by "-" and the thread's index, e.g. "worker-host-42-1a2b3c4d-0".
   return worker.workerId
 
-proc registerJob*(worker: RemoteWorker, name: string, handler: JobHandler) =
-  ## Must be called before start() or run().
+proc registerJob*(
+    worker: RemoteWorker,
+    name: string,
+    handler: JobHandler,
+    maxRetries: int = 0,
+    retryDelaySeconds: float = defaultRetryDelaySeconds,
+    retryOn: seq[string] = @[],
+) =
+  ## Must be called before start() or run(). `maxRetries`,
+  ## `retryDelaySeconds` and `retryOn` work as for JobQueue.registerJob: they
+  ## apply when the handler raises RetryableJobError or an exception whose
+  ## type is named in `retryOn`.
   if worker.isRunning or worker.isStopped:
     raise newException(ValueError, "jobs must be registered before the worker starts")
-  worker.registry.registerJob(name, handler)
+  worker.registry.registerJob(name, handler, maxRetries, retryDelaySeconds, retryOn)
 
 proc start*(worker: RemoteWorker) =
   ## Start the threads and return at once. Mainly useful for tests; run()

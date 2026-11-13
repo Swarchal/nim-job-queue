@@ -1,7 +1,7 @@
 ## A Nim client for the HTTP API. Anything that can speak HTTP and JSON can
 ## use the server; this module is just a convenience.
 
-import std/[httpclient, json, os, strutils, times, uri]
+import std/[httpclient, json, net, os, strutils, times, uri]
 import ./types
 
 type
@@ -14,17 +14,23 @@ type
     status*: JobStatus
     result*: JsonNode ## nil unless status is jsSucceeded
     errorMessage*: string ## "" unless status is jsFailed
+    retries*: int ## times the job was run again after RetryableJobError
 
   QueueStatus* = object ## How busy the server is, from GET /status.
     workers*: int ## the server's own worker threads
-    remoteWorkers*: int ## remote workers heard from within the last lease period
+    remoteWorkers*: int
+      ## Remote worker job threads (each has its own worker id) heard from
+      ## within the last lease period.
     queued*: int
     running*: int
     succeeded*: int
     failed*: int
 
   JobQueueError* = object of CatchableError
-    ## The server rejected a request (unknown job name, unknown id, ...).
+    ## The server answered with an error status. A 4xx code means it refused
+    ## the request (unknown job name, unknown id, ...); a 5xx code means it,
+    ## or a proxy in front of it, failed, and trying again later may work.
+    httpCode*: HttpCode
 
   JobTimeoutError* = object of CatchableError
     ## waitForJob gave up before the job finished.
@@ -35,9 +41,26 @@ proc newJobClient*(baseUrl: string): JobClient =
   trimmedUrl.removeSuffix("/")
   return JobClient(baseUrl: trimmedUrl)
 
-proc newJsonHttpClient*(): HttpClient =
+const defaultRequestTimeoutSeconds* = 30.0
+  ## How long a request may wait for the server to send more of its reply.
+
+proc newJsonHttpClient*(
+    timeoutSeconds: float = defaultRequestTimeoutSeconds
+): HttpClient =
   ## An HTTP client that sends JSON. Used here and by remote_worker.nim.
-  return newHttpClient(headers = newHttpHeaders({"Content-Type": "application/json"}))
+  ##
+  ## A request raises TimeoutError (from std/net) when the server sends
+  ## nothing for `timeoutSeconds`. Without a timeout, a server or network
+  ## that stops responding mid-request would block the caller for ever.
+  ## (Connecting is not covered: that is limited by the operating system.)
+  return newHttpClient(
+    headers = newHttpHeaders({"Content-Type": "application/json"}),
+    timeout = int(timeoutSeconds * 1000),
+  )
+
+proc newJobQueueError(httpCode: HttpCode, message: string): ref JobQueueError =
+  result = newException(JobQueueError, message)
+  result.httpCode = httpCode
 
 proc sendRequest*(
     client: JobClient,
@@ -48,8 +71,9 @@ proc sendRequest*(
 ): JsonNode =
   ## Send one request over `httpClient` and return the parsed JSON reply.
   ## Used here and by remote_worker.nim.
-  ## Raises JobQueueError if the server answers with an error status;
-  ## connection problems raise the usual OSError.
+  ## Raises JobQueueError if the server answers with an error status or a
+  ## reply that is not JSON; connection problems raise the usual OSError,
+  ## and a server that stops answering raises TimeoutError.
   let response =
     httpClient.request(client.baseUrl & path, httpMethod = httpMethod, body = body)
 
@@ -57,15 +81,15 @@ proc sendRequest*(
   try:
     reply = parseJson(response.body)
   except JsonParsingError:
-    raise newException(
-      JobQueueError, "the server sent a reply that is not JSON: " & response.status
+    raise newJobQueueError(
+      response.code, "the server sent a reply that is not JSON: " & response.status
     )
 
   if not response.code.is2xx():
     var message = response.status
     if reply.kind == JObject and reply.hasKey("error"):
       message = reply["error"].getStr()
-    raise newException(JobQueueError, message)
+    raise newJobQueueError(response.code, message)
   return reply
 
 proc submitJob*(client: JobClient, name: string, args: JsonNode): string =
@@ -86,6 +110,7 @@ proc getJobWith(client: JobClient, httpClient: HttpClient, jobId: string): JobIn
     id: reply["id"].getStr(),
     name: reply["name"].getStr(),
     status: parseEnum[JobStatus](reply["status"].getStr()),
+    retries: reply{"retries"}.getInt(),
   )
   if result.status == jsSucceeded:
     result.result = reply["result"]
@@ -131,13 +156,25 @@ proc waitForJob*(
     pollIntervalSeconds: float = 0.2,
 ): JobInfo =
   ## Poll getJob until the job has succeeded or failed.
-  ## Raises JobTimeoutError if that takes longer than timeoutSeconds.
-  ## Every poll reuses one keep-alive connection.
+  ## Raises JobTimeoutError if that takes longer than timeoutSeconds, even
+  ## when the server stops answering. Every poll reuses one keep-alive
+  ## connection.
   let deadline = epochTime() + timeoutSeconds
   let httpClient = newJsonHttpClient()
   try:
     while true:
-      let job = client.getJobWith(httpClient, jobId)
+      # Never wait on the server past the deadline.
+      let secondsLeft = deadline - epochTime()
+      let requestTimeoutSeconds = clamp(secondsLeft, 0.1, defaultRequestTimeoutSeconds)
+      httpClient.timeout = int(requestTimeoutSeconds * 1000)
+      var job: JobInfo
+      try:
+        job = client.getJobWith(httpClient, jobId)
+      except TimeoutError:
+        raise newException(
+          JobTimeoutError,
+          "gave up waiting for job " & jobId & ": the server stopped answering",
+        )
       if job.status == jsSucceeded or job.status == jsFailed:
         return job
       if epochTime() >= deadline:

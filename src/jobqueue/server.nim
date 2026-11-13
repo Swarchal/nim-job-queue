@@ -14,6 +14,10 @@
 ##   POST /jobs/{id}/heartbeat  {"workerId": "w1"}  -> 200, or 409 if the job is no longer theirs
 ##   POST /jobs/{id}/result     {"workerId": "w1", "succeeded": true, "result": ...}
 ##                           or {"workerId": "w1", "succeeded": false, "error": "..."}
+##                           ("error" may be left out)
+##                           or {"workerId": "w1", "succeeded": false, "error": "...",
+##                               "retry": true, "retryDelaySeconds": 2.0}
+##                           to put the job back in the queue
 ##                           -> 200, or 409 if the job is no longer theirs
 
 import
@@ -53,6 +57,11 @@ const jobPathPrefix = "/jobs/"
 
 const defaultLeaseSeconds = 30.0
 
+const maintenanceIntervalMilliseconds = 100
+  ## How often expired leases and due retries are looked for.
+
+const noErrorMessage = "the worker reported a failure without an error message"
+
 var interruptRequested: bool ## set by the ctrl-c hook, read by serve()
 
 proc handleControlC() {.noconv.} =
@@ -62,11 +71,27 @@ proc newJobQueue*(config: JobQueueConfig): JobQueue =
   result = JobQueue(config: config)
   initJobStore(result.store, config.databasePath, config.maxFinishedJobs)
 
-proc registerJob*(queue: JobQueue, name: string, handler: JobHandler) =
+proc registerJob*(
+    queue: JobQueue,
+    name: string,
+    handler: JobHandler,
+    maxRetries: int = 0,
+    retryDelaySeconds: float = defaultRetryDelaySeconds,
+    retryOn: seq[string] = @[],
+) =
   ## Must be called before start() or serve().
+  ##
+  ## When the handler raises RetryableJobError, or an exception whose type is
+  ## named in `retryOn` (e.g. @["TimeoutError", "OSError"]), the job is run
+  ## again, up to `maxRetries` times, waiting `retryDelaySeconds` before the
+  ## first retry and twice as long before each later one. Any other exception
+  ## fails the job at once.
+  ##
+  ## `retryOn` names are compared with the exact type raised: "OSError" does
+  ## not cover an IOError or a type that inherits from OSError.
   if queue.state != qsNew:
     raise newException(ValueError, "jobs must be registered before the server starts")
-  queue.registry.registerJob(name, handler)
+  queue.registry.registerJob(name, handler, maxRetries, retryDelaySeconds, retryOn)
 
 proc leaseSeconds(queue: JobQueue): float =
   if queue.config.leaseSeconds > 0:
@@ -89,7 +114,7 @@ proc timestampToJson(unixSeconds: float): JsonNode =
 
 proc jobToJson(job: JobRecord): JsonNode =
   ## The JSON shape returned by GET /jobs/{id} and parsed by the client:
-  ## {"id", "name", "status", "result", "error",
+  ## {"id", "name", "status", "result", "error", "retries",
   ##  "submittedAt", "startedAt", "finishedAt"}
   var resultNode = newJNull()
   if job.status == jsSucceeded:
@@ -105,6 +130,7 @@ proc jobToJson(job: JobRecord): JsonNode =
     "status": $job.status,
     "result": resultNode,
     "error": errorNode,
+    "retries": job.retryCount,
     "submittedAt": timestampToJson(job.submittedAt),
     "startedAt": timestampToJson(job.startedAt),
     "finishedAt": timestampToJson(job.finishedAt),
@@ -184,14 +210,20 @@ proc claimJobReply(queue: JobQueue, body: string): HttpReply =
     if nameNode.kind != JString or nameNode.getStr().len == 0:
       raise newException(BadRequestError, "'jobNames' must hold non-empty strings")
     jobNames.add(nameNode.getStr())
-    queue.remoteJobNames.incl(nameNode.getStr())
+  # Only remember the names once the whole request is known to be valid, so a
+  # rejected request cannot make a name submittable.
+  for name in jobNames:
+    queue.remoteJobNames.incl(name)
   queue.remoteWorkerLastSeen[workerId] = epochTime()
 
   let job = queue.store.claimJob(jobNames, workerId, queue.leaseSeconds())
   var jobNode = newJNull()
   if job.isSome():
     jobNode = %*{
-      "id": job.get().id, "name": job.get().name, "args": parseJson(job.get().argsJson)
+      "id": job.get().id,
+      "name": job.get().name,
+      "args": parseJson(job.get().argsJson),
+      "retries": job.get().retryCount,
     }
   return jsonReply(Http200, %*{"job": jobNode, "leaseSeconds": queue.leaseSeconds()})
 
@@ -202,6 +234,37 @@ proc heartbeatReply(queue: JobQueue, jobId: string, body: string): HttpReply =
   if not queue.store.extendLease(jobId, workerId, queue.leaseSeconds()):
     return notYourJobReply(jobId, workerId)
   return jsonReply(Http200, %*{"leaseSeconds": queue.leaseSeconds()})
+
+proc failureMessage(request: JsonNode): string =
+  ## The "error" of a failure report. It may be missing or empty: refusing the
+  ## report would leave the job running until its lease expired, after which
+  ## it would run, and fail, all over again.
+  if not request.hasKey("error") or request["error"].kind == JNull:
+    return noErrorMessage
+  if request["error"].kind != JString:
+    raise newException(BadRequestError, "'error' must be a string")
+  if request["error"].getStr().len == 0:
+    return noErrorMessage
+  return request["error"].getStr()
+
+proc retryRequested(request: JsonNode): bool =
+  ## The optional "retry" of a failure report.
+  if not request.hasKey("retry"):
+    return false
+  if request["retry"].kind != JBool:
+    raise newException(BadRequestError, "'retry' must be a boolean")
+  return request["retry"].getBool()
+
+proc retryDelaySeconds(request: JsonNode): float =
+  ## The optional "retryDelaySeconds" of a failure report that asks for a retry.
+  if not request.hasKey("retryDelaySeconds"):
+    return 0.0
+  let delayNode = request["retryDelaySeconds"]
+  if delayNode.kind notin {JInt, JFloat} or delayNode.getFloat() < 0:
+    raise newException(
+      BadRequestError, "'retryDelaySeconds' must be a number that is not negative"
+    )
+  return delayNode.getFloat()
 
 proc resultReply(queue: JobQueue, jobId: string, body: string): HttpReply =
   let request = parseObjectBody(body)
@@ -216,8 +279,10 @@ proc resultReply(queue: JobQueue, jobId: string, body: string): HttpReply =
     if request.hasKey("result"):
       resultNode = request["result"]
     recorded = queue.store.markSucceeded(jobId, workerId, $resultNode)
+  elif retryRequested(request):
+    recorded = queue.store.retryJob(jobId, workerId, retryDelaySeconds(request))
   else:
-    recorded = queue.store.markFailed(jobId, workerId, requireString(request, "error"))
+    recorded = queue.store.markFailed(jobId, workerId, failureMessage(request))
 
   if not recorded:
     return notYourJobReply(jobId, workerId)
@@ -323,10 +388,10 @@ proc acceptLoop(queue: JobQueue) {.async.} =
         stderr.writeLine("jobqueue: could not accept a connection: " & error.msg)
         await sleepAsync(100)
 
-proc leaseLoop(queue: JobQueue) {.async.} =
+proc maintenanceLoop(queue: JobQueue) {.async.} =
   ## Every so often, put jobs whose remote worker has stopped sending
-  ## heartbeats back in the queue.
-  let checkIntervalMilliseconds = int(min(1.0, queue.leaseSeconds() / 2) * 1000)
+  ## heartbeats back in the queue, and wake the worker threads for jobs whose
+  ## wait before a retry is over.
   while queue.state == qsRunning:
     try:
       let requeuedCount = queue.store.requeueExpiredLeases()
@@ -335,9 +400,10 @@ proc leaseLoop(queue: JobQueue) {.async.} =
           "jobqueue: put " & $requeuedCount &
             " job(s) back in the queue: their remote worker stopped responding"
         )
+      queue.store.wakeForDueJobs()
     except CatchableError as error:
-      stderr.writeLine("jobqueue: could not check worker leases: " & error.msg)
-    await sleepAsync(checkIntervalMilliseconds)
+      stderr.writeLine("jobqueue: could not check leases and retries: " & error.msg)
+    await sleepAsync(maintenanceIntervalMilliseconds)
 
 proc start*(queue: JobQueue) =
   ## Start the worker threads and begin listening, without blocking. The
@@ -377,7 +443,7 @@ proc start*(queue: JobQueue) =
 
   queue.state = qsRunning
   asyncCheck acceptLoop(queue)
-  asyncCheck leaseLoop(queue)
+  asyncCheck maintenanceLoop(queue)
 
 proc port*(queue: JobQueue): int =
   ## The port being listened on. Differs from the configured port when that

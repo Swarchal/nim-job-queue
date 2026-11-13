@@ -43,8 +43,9 @@ purely a queue. `PLAN.md` has the claim/heartbeat/result protocol.
   requests after `stop()` get 503; request-body helpers raise
   `BadRequestError`, which becomes 400. `serve()` = `start()` + poll loop +
   ctrl-c handling; `start()`/`stop()`/`port()` exist for tests and
-  embedding. `leaseLoop` re-queues jobs whose remote worker stopped
-  heartbeating, so it only runs while something drives the async loop.
+  embedding. `maintenanceLoop` re-queues jobs whose remote worker stopped
+  heartbeating and wakes the threads for due retries, so both only happen
+  while something drives the async loop.
 - `store.nim`: the only state shared between threads. It owns the lock and
   the "job available" condition variable, and every public proc takes the
   lock itself. Storage is always `sqlite_backend.nim`: `:memory:` by
@@ -72,9 +73,21 @@ Invariants to preserve:
   lease gets 409. The server's own threads use the reserved id `local` and
   `leaseExpiresAt = 0` (never expires). Remote worker ids must be unique
   across processes: `newWorkerId` uses host, pid and OS randomness, because
-  `std/oids` collides between processes started in the same second.
+  `std/oids` collides between processes started in the same second. Each
+  remote job thread appends its index (`threadWorkerId`), so ownership is
+  per thread and a sibling thread cannot report a job it lost.
+- `JobQueueError.httpCode` separates refusals (4xx, final) from server
+  failures (5xx, retried by the remote worker). Every `HttpClient` comes from
+  `newJsonHttpClient`, which sets a timeout; never block for ever.
 - Jobs run at least once: running jobs are re-queued (ahead of newer jobs) on
   server restart and when a lease expires.
+- Retries: only a handler raising `RetryableJobError`, or an exception whose
+  exact type name is in the registration's `retryOn`, causes one, and
+  `runJob` alone decides (from `JobRecord.retryCount` and the registration's
+  `maxRetries`), for server threads and remote workers alike. A retried job
+  is queued with a `run_after` time that `claimNextJob` respects; blocked
+  server threads are woken for it by `wakeForDueJobs`, called from
+  `maintenanceLoop`. Lease expiry and restart re-runs do not count as retries.
 - `maxFinishedJobs` removes finished jobs in finish order, not submission
   order. The SQLite backend relies on `finished_at > 0` meaning "finished"
   (its partial index and retention query use it) and keeps

@@ -24,6 +24,48 @@ queue.serve() # blocks until ctrl-c
 
 A job fails if its proc raises; the exception message is returned to the caller.
 
+## Retrying on certain errors
+
+A job that raises `RetryableJobError` (or an error type that inherits from
+it) is put back in the queue and run again, if it was registered with
+`maxRetries`. Any other exception still fails the job at once, so the job
+decides which of its errors are worth another try:
+
+```nim
+proc fetchPage(args: JsonNode): JsonNode {.gcsafe, nimcall.} =
+  try:
+    return %download(args["url"].getStr())
+  except TimeoutError as error:
+    # The site may answer next time.
+    raise newException(RetryableJobError, error.msg)
+  # A ValueError for a malformed url, say, is not caught: no retry.
+
+queue.registerJob("fetch-page", fetchPage, maxRetries = 3, retryDelaySeconds = 2.0)
+```
+
+Errors can also be named when the job is registered, so the handler does
+not have to catch them:
+
+```nim
+queue.registerJob(
+  "fetch-page", fetchPage, maxRetries = 3, retryOn = @["TimeoutError", "OSError"]
+)
+```
+
+The names are compared with the exact type of the exception raised, so
+`"OSError"` does not cover an `IOError` or a type that inherits from
+`OSError`, and a misspelt name never matches. `RetryableJobError` keeps
+working alongside `retryOn`.
+
+The job waits `retryDelaySeconds` (default 1) before the first retry and
+twice as long before each later one (2, 4, 8 seconds here), up to an hour.
+After `maxRetries` retries it fails with the last error. `GET /jobs/{id}`
+and `JobInfo.retries` say how many retries a job has had. Remote workers
+take the same arguments in `worker.registerJob`.
+
+`examples/example_server.nim` has a `flaky-greeting` job that does this, and
+`examples/example_client.nim` submits it.
+
 ## Remote workers
 
 Jobs can also run in separate worker processes, on any machine that can

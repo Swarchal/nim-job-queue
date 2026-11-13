@@ -16,6 +16,9 @@ type JobStore* = object
   lock: Lock
   jobIsAvailable: Cond ## signalled when a job is queued or on shutdown
   isShuttingDown: bool
+  nextDelayedJobAt: float
+    ## When the next job waiting for a retry becomes due, so that
+    ## wakeForDueJobs knows when to wake the worker threads. 0.0 if none.
   backend: SqliteBackend
 
 proc initJobStore*(
@@ -34,6 +37,7 @@ proc initJobStore*(
   initLock(store.lock)
   initCond(store.jobIsAvailable)
   store.backend = openSqliteBackend(path, maxFinishedJobs)
+  store.nextDelayedJobAt = store.backend.earliestDelayedJob(epochTime())
 
 proc recoveredJobCount*(store: var JobStore): int =
   ## How many jobs were found interrupted by a previous shutdown or crash and
@@ -99,6 +103,34 @@ proc requeueExpiredLeases*(store: var JobStore): int =
     result = store.backend.requeueExpiredLeases(epochTime())
     if result > 0:
       broadcast(store.jobIsAvailable)
+
+proc retryJob*(
+    store: var JobStore, jobId: string, workerId: string, delaySeconds: float
+): bool =
+  ## Put a running job back in the queue to be run again, no sooner than
+  ## `delaySeconds` from now, ahead of newer jobs. Returns false, and changes
+  ## nothing, if the job is not running on `workerId`.
+  ##
+  ## With a delay, worker threads blocked in takeNextJob only notice the job
+  ## once wakeForDueJobs is called after it has become due.
+  withLock store.lock:
+    let runAfter = epochTime() + max(delaySeconds, 0.0)
+    result = store.backend.retryJob(jobId, workerId, runAfter)
+    if result:
+      if delaySeconds <= 0:
+        signal(store.jobIsAvailable)
+      elif store.nextDelayedJobAt == 0.0 or runAfter < store.nextDelayedJobAt:
+        store.nextDelayedJobAt = runAfter
+
+proc wakeForDueJobs*(store: var JobStore) =
+  ## Wake the worker threads if a job that was waiting for a retry has
+  ## become due. Cheap when nothing is waiting; the server calls it ten
+  ## times a second.
+  withLock store.lock:
+    let now = epochTime()
+    if store.nextDelayedJobAt > 0.0 and now >= store.nextDelayedJobAt:
+      broadcast(store.jobIsAvailable)
+      store.nextDelayedJobAt = store.backend.earliestDelayedJob(now)
 
 proc finishJob(
     store: var JobStore,

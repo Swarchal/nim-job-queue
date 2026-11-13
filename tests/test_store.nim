@@ -1,4 +1,5 @@
-import std/[options, unittest]
+import std/[options, os, unittest]
+import db_connector/db_sqlite
 import jobqueue/[store, types]
 import ./helpers
 
@@ -169,6 +170,47 @@ for backendName in ["memory", "sqlite"]:
       check store.requeueExpiredLeases() == 0
       check store.getJob(jobId).get().status == jsRunning
 
+    test "retryJob queues the job again, ahead of newer jobs, and counts it":
+      let retriedId = store.addJob("add", "{}")
+      let newerId = store.addJob("add", "{}")
+      discard store.takeNextJob(@[], testWorker)
+
+      check store.retryJob(retriedId, testWorker, delaySeconds = 0.0)
+      let job = store.getJob(retriedId).get()
+      check job.status == jsQueued
+      check job.retryCount == 1
+      check job.workerId == ""
+      check job.startedAt == 0.0
+
+      let claimed = store.takeNextJob(@[], testWorker).get()
+      check claimed.id == retriedId
+      check claimed.retryCount == 1
+      check store.takeNextJob(@[], testWorker).get().id == newerId
+
+    test "a job waiting for a retry is not handed out until its delay is over":
+      let retriedId = store.addJob("add", "{}")
+      let newerId = store.addJob("add", "{}")
+      discard store.claimJob(@["add"], "w1", 30.0)
+      check store.retryJob(retriedId, "w1", delaySeconds = 0.05)
+      check store.getJob(retriedId).get().runAfter > 0.0
+      check store.queuedCount() == 2
+
+      # The newer job does not have to wait behind it.
+      check store.claimJob(@["add"], "w1", 30.0).get().id == newerId
+      check store.claimJob(@["add"], "w1", 30.0).isNone()
+
+      sleep(80)
+      store.wakeForDueJobs()
+      check store.claimJob(@["add"], "w1", 30.0).get().id == retriedId
+
+    test "retryJob is refused for a job that is not running on that worker":
+      let jobId = store.addJob("add", "{}")
+      check not store.retryJob(jobId, "w1", 0.0) # still queued
+      discard store.claimJob(@["add"], "w1", 30.0)
+      check not store.retryJob(jobId, "w2", 0.0)
+      check store.getJob(jobId).get().status == jsRunning
+      check store.getJob(jobId).get().retryCount == 0
+
     test "maxFinishedJobs removes the jobs that finished longest ago":
       var cappedPath = ""
       if backendName == "sqlite":
@@ -242,6 +284,54 @@ suite "store (sqlite) across restarts":
     check secondStore.getJob(interruptedId).get().startedAt == 0.0
     check secondStore.takeNextJob(@[], testWorker).get().id == interruptedId
     check secondStore.takeNextJob(@[], testWorker).get().id == waitingId
+    closeJobStore(secondStore)
+
+  test "a job waiting for a retry keeps its count and its delay":
+    let retriedId = firstStore.addJob("retried", "{}")
+    discard firstStore.takeNextJob(@[], testWorker)
+    check firstStore.retryJob(retriedId, testWorker, delaySeconds = 60.0)
+    closeJobStore(firstStore)
+
+    var secondStore: JobStore
+    initJobStore(secondStore, databasePath)
+    check secondStore.recoveredJobCount() == 0
+    check secondStore.getJob(retriedId).get().retryCount == 1
+    check secondStore.claimJob(@[], "w1", 30.0).isNone()
+    closeJobStore(secondStore)
+
+  test "a database file from before retries existed is brought up to date":
+    closeJobStore(firstStore)
+    removeDatabase(databasePath)
+    let oldDatabase = open(databasePath, "", "", "")
+    oldDatabase.exec(
+      sql"""CREATE TABLE jobs (
+              sequence         INTEGER PRIMARY KEY AUTOINCREMENT,
+              id               TEXT NOT NULL UNIQUE,
+              name             TEXT NOT NULL,
+              status           TEXT NOT NULL,
+              args_json        TEXT NOT NULL,
+              result_json      TEXT NOT NULL DEFAULT '',
+              error_message    TEXT NOT NULL DEFAULT '',
+              submitted_at     REAL NOT NULL,
+              started_at       REAL NOT NULL DEFAULT 0,
+              finished_at      REAL NOT NULL DEFAULT 0,
+              worker_id        TEXT NOT NULL DEFAULT '',
+              lease_expires_at REAL NOT NULL DEFAULT 0
+            )"""
+    )
+    oldDatabase.exec(
+      sql"""INSERT INTO jobs (id, name, status, args_json, submitted_at)
+            VALUES ('old-job', 'add', 'queued', '{}', 1.0)"""
+    )
+    oldDatabase.close()
+
+    var secondStore: JobStore
+    initJobStore(secondStore, databasePath)
+    let job = secondStore.takeNextJob(@[], testWorker).get()
+    check job.id == "old-job"
+    check job.retryCount == 0
+    check secondStore.retryJob("old-job", testWorker, 0.0)
+    check secondStore.getJob("old-job").get().retryCount == 1
     closeJobStore(secondStore)
 
   test "a lower maxFinishedJobs is applied when the file is reopened":

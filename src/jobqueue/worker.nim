@@ -1,7 +1,7 @@
 ## The server's own worker pool: threads that take jobs from the store and
 ## run them. `runJob` is also used by remote workers (remote_worker.nim).
 
-import std/[json, options, os]
+import std/[json, math, options, os]
 import ./[registry, store, types]
 
 const localWorkerId* = "local"
@@ -16,6 +16,11 @@ type
     succeeded*: bool
     resultJson*: string ## set when succeeded
     errorMessage*: string ## set when not succeeded
+    shouldRetry*: bool
+      ## Not succeeded, but the job should go back in the queue rather than
+      ## be marked failed: the handler raised RetryableJobError and the job
+      ## has retries left.
+    retryDelaySeconds*: float ## set when shouldRetry: how long to wait first
 
   WorkerContext* = object
     ## What each thread is given at start-up. The pointers refer to fields of
@@ -26,13 +31,28 @@ type
 proc failedOutcome(errorMessage: string): JobOutcome =
   return JobOutcome(succeeded: false, errorMessage: errorMessage)
 
+proc retryDelay(registeredJob: RegisteredJob, retryCount: int): float =
+  ## The wait before retry number `retryCount + 1`: the registered delay,
+  ## doubled for every retry already made, up to maxRetryDelaySeconds.
+  let doubled = registeredJob.retryDelaySeconds * pow(2.0, float(retryCount))
+  return min(doubled, maxRetryDelaySeconds)
+
+proc isRetryable(registeredJob: RegisteredJob, error: ref Exception): bool =
+  ## RetryableJobError and the types that inherit from it always are; other
+  ## errors only if the job was registered with their exact name in `retryOn`.
+  return error of RetryableJobError or $error.name in registeredJob.retryOn
+
 proc runJob*(registry: JobRegistry, job: JobRecord): JobOutcome {.gcsafe.} =
   ## Look up the handler, parse the arguments, call the handler and catch
   ## anything it raises. Never raises itself. Kept separate from the thread
   ## loop so it can be unit tested without threads.
-  let handler = registry.findHandler(job.name)
-  if handler.isNone():
+  ##
+  ## Whether a failure is retried is decided here, from the handler's
+  ## exception, the job's registration and `job.retryCount`.
+  let registered = registry.findJob(job.name)
+  if registered.isNone():
     return failedOutcome(unknownJobMessage(job.name))
+  let registeredJob = registered.get()
 
   var args: JsonNode
   try:
@@ -41,14 +61,26 @@ proc runJob*(registry: JobRegistry, job: JobRecord): JobOutcome {.gcsafe.} =
     return failedOutcome("job arguments are not valid JSON: " & error.msg)
 
   try:
-    let handlerResult = handler.get()(args)
+    let handlerResult = registeredJob.handler(args)
     if handlerResult.isNil():
       return JobOutcome(succeeded: true, resultJson: "null")
     return JobOutcome(succeeded: true, resultJson: $handlerResult)
   except Exception as error:
     # Exception rather than CatchableError, so that a bug in one job (an
     # index out of range, say) fails that job instead of killing the server.
-    return failedOutcome($error.name & ": " & error.msg)
+    var message = $error.name & ": " & error.msg
+    if not isRetryable(registeredJob, error):
+      return failedOutcome(message)
+    if job.retryCount < registeredJob.maxRetries:
+      return JobOutcome(
+        succeeded: false,
+        errorMessage: message,
+        shouldRetry: true,
+        retryDelaySeconds: retryDelay(registeredJob, job.retryCount),
+      )
+    if job.retryCount > 0:
+      message.add(" (gave up after " & $job.retryCount & " retries)")
+    return failedOutcome(message)
 
 proc runNextJob(context: WorkerContext, jobNames: seq[string]): bool =
   ## Take one job, run it and record the outcome. Returns false once the
@@ -63,6 +95,8 @@ proc runNextJob(context: WorkerContext, jobNames: seq[string]): bool =
   let outcome = runJob(context.registry[], job)
   if outcome.succeeded:
     discard context.store[].markSucceeded(job.id, localWorkerId, outcome.resultJson)
+  elif outcome.shouldRetry:
+    discard context.store[].retryJob(job.id, localWorkerId, outcome.retryDelaySeconds)
   else:
     discard context.store[].markFailed(job.id, localWorkerId, outcome.errorMessage)
   return true

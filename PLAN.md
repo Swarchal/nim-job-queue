@@ -32,12 +32,15 @@ caller <──HTTP── server.nim <──getJob── store.nim <──markSuc
 remote_worker.nim ──POST /workers/claim──────> server.nim ──claimJob──────> store.nim
  (N job threads)  ──POST /jobs/{id}/result───>            ──markSucceeded/markFailed
  (1 heartbeat     ──POST /jobs/{id}/heartbeat>            ──extendLease
-  thread)                                      leaseLoop ──requeueExpiredLeases (every second)
+  thread)                                      maintenanceLoop ──requeueExpiredLeases (every 0.1 s)
 ```
 
 - A worker claims jobs by listing the names it can run. The server remembers those names, so callers can then submit them even though the server cannot run them itself.
+- Each job thread of a remote worker has its own worker id (`<process id>-<thread index>`), so `remoteWorkers` in `GET /status` counts job threads, like `workers` does for the server. A per-process id would let one thread report a job that a sibling thread had re-claimed after the first thread's lease expired.
 - A claimed job belongs to that worker id and has a lease (`leaseSeconds`, default 30). The worker sends a heartbeat every third of a lease; if they stop, the server puts the job back in the queue, in its original order, for another worker. Only the worker holding a job can report its result, so a late result from a worker that lost its lease is refused with `409`.
 - The server's own threads use the same claim rules, but only for jobs registered on the server, under the reserved worker id `local`, and with no lease. A server with no jobs registered starts no threads and is purely a queue.
+- Every HTTP request has a timeout (`defaultRequestTimeoutSeconds`, 30 s, per wait for data, not for the whole request); heartbeats use a third of the lease. Connecting has no timeout of its own beyond the operating system's.
+- A worker sends a result again, with a growing pause, when the server cannot be reached or answers 5xx (a database error, or a proxy's 502). A 4xx answer, such as 409 for a lost lease, is final.
 - Deploying new or changed jobs: start workers with the new code, then press ctrl-c on the old ones. They finish their current job, report it, and exit.
 
 ## HTTP API
@@ -45,13 +48,25 @@ remote_worker.nim ──POST /workers/claim──────> server.nim ──
 | Request | Reply |
 | --- | --- |
 | `POST /jobs` with `{"name": "add", "args": {"a": 1, "b": 2}}` | `202 {"id": "...", "status": "queued"}`; `400` for bad JSON or an unknown name |
-| `GET /jobs/{id}` | `200 {"id", "name", "status", "result", "error", "submittedAt", "startedAt", "finishedAt"}`; `404` if unknown |
+| `GET /jobs/{id}` | `200 {"id", "name", "status", "result", "error", "retries", "submittedAt", "startedAt", "finishedAt"}`; `404` if unknown |
 | `GET /job-names` | `200 ["add", ...]` |
 | `GET /status` | `200 {"workers": 4, "remoteWorkers": 2, "queued": 3, "running": 4, "succeeded": 120, "failed": 2}` |
 | `GET /health` | `200 {"status": "ok", "queued": 3}` |
-| `POST /workers/claim` with `{"workerId": "w1", "jobNames": ["add"]}` | `200 {"job": {"id", "name", "args"} or null, "leaseSeconds": 30}` |
+| `POST /workers/claim` with `{"workerId": "w1", "jobNames": ["add"]}` | `200 {"job": {"id", "name", "args", "retries"} or null, "leaseSeconds": 30}` |
 | `POST /jobs/{id}/heartbeat` with `{"workerId": "w1"}` | `200`; `409` if the job is no longer running on that worker |
-| `POST /jobs/{id}/result` with `{"workerId": "w1", "succeeded": true, "result": ...}` or `{..., "succeeded": false, "error": "..."}` | `200`; `409` if the job is no longer running on that worker |
+| `POST /jobs/{id}/result` with `{"workerId": "w1", "succeeded": true, "result": ...}` or `{..., "succeeded": false, "error": "..."}` (`error` may be empty or left out). A failure may add `"retry": true` and `"retryDelaySeconds": 2.0` to put the job back in the queue instead of failing it | `200`; `409` if the job is no longer running on that worker |
+
+## Retries
+
+- A handler raises `RetryableJobError` (or a type that inherits from it) to say a failure is worth another try. Every other exception fails the job at once.
+- `registerJob(..., retryOn = @["TimeoutError"])` names further exception types to retry, so a handler need not catch and re-raise them. Names are compared with the exact type raised (`error.name`), not by inheritance: Nim does not expose an exception's parent types by name at run time. `retryOn` without `maxRetries` is rejected, since it would never retry.
+- The limit belongs to the registration, not the submission: `registerJob(name, handler, maxRetries = 3, retryDelaySeconds = 1.0)`. The job's author knows which errors are transient and how long they last; callers do not have to.
+- `runJob` decides. It compares the job's `retryCount` with `maxRetries` and returns an outcome with `shouldRetry` and a delay: `retryDelaySeconds`, doubled for every retry already made, capped at an hour (`maxRetryDelaySeconds`). Once the retries are used up the job fails with the last error.
+- The store's `retryJob` puts the job back in the queue with `retry_count + 1` and a `run_after` time. `claimNextJob` skips queued jobs whose `run_after` has not passed. The job keeps its place (`sequence`), so once due it runs ahead of newer jobs.
+- Remote workers decide the same way: the claim reply carries `retries`, and the worker reports `"retry": true` with the delay. The server trusts the worker, as it does for results; two workers registered with different `maxRetries` each apply their own.
+- The server's threads block on a condition variable, which cannot time out, so `maintenanceLoop` calls `wakeForDueJobs` on each tick (every 0.1 s). A retry on the server's own threads can therefore start up to a tenth of a second late, and a store used without a running server only wakes for retries with no delay.
+- Only `RetryableJobError` counts as a retry. Re-runs after a lost lease or a restart do not touch `retry_count`.
+- Database files from before retries get the two new columns added on opening.
 
 ## Modules
 
@@ -108,11 +123,12 @@ Two additions to the original plan, both in `server.nim`:
 1. Result retention by age (drop finished jobs after N seconds). Retention by count is done: `maxFinishedJobs`.
 2. Long-poll `GET /jobs/{id}?wait=10` and `POST /workers/claim` so callers and workers don't have to poll.
 3. `DELETE /jobs/{id}` to cancel a job that is still queued.
-4. Retries with a per-job maximum.
-5. Delayed / scheduled jobs.
-6. Priorities or multiple named queues.
-7. A lock file so two servers cannot open the same database.
-8. Authentication: at least a shared secret for workers.
+4. Delayed / scheduled jobs (the `run_after` column that retries use is most of this).
+5. Priorities or multiple named queues.
+6. A lock file so two servers cannot open the same database.
+7. Authentication: at least a shared secret for workers.
+
+Done: retries (see above).
 
 ## Open questions
 
